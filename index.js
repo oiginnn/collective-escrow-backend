@@ -34,12 +34,23 @@ app.post("/webhook", async (req, res) => {
   const text = message.text || "";
 
   // create user if not exists
-await supabaseRequest(
+// create user
+const userRes = await supabaseRequest(
   "users",
   "POST",
   {
     telegram_id: telegramId,
     role: "user"
+  }
+);
+
+// create balance (ignore if already exists)
+await supabaseRequest(
+  "user_balances",
+  "POST",
+  {
+    user_id: null,
+    balance: 0
   }
 );
 
