@@ -12,10 +12,22 @@ const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
+/* ================== IN-MEMORY RATE LIMIT ================== */
+
+const startLimits = new Map(); // telegramId -> timestamp
+
+function isRateLimited(telegramId) {
+  const now = Date.now();
+  const last = startLimits.get(telegramId) || 0;
+  if (now - last < 10_000) return true; // 10 sec
+  startLimits.set(telegramId, now);
+  return false;
+}
+
 /* ================== HELPERS ================== */
 
 async function supabase(path, method = "GET", body) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+  return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     method,
     headers: {
       apikey: SUPABASE_KEY,
@@ -25,17 +37,16 @@ async function supabase(path, method = "GET", body) {
     },
     body: body ? JSON.stringify(body) : undefined
   });
-
-  return res;
 }
 
-async function sendMessage(chatId, text) {
+async function sendMessage(chatId, text, replyMarkup) {
   await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
-      text
+      text,
+      reply_markup: replyMarkup
     })
   });
 }
@@ -53,7 +64,12 @@ app.post("/webhook", async (req, res) => {
 
     /* ---------- /start ---------- */
     if (text.startsWith("/start")) {
-      // 1. GET user
+      if (isRateLimited(telegramId)) {
+        await sendMessage(chatId, "Please wait a few seconds before retrying.");
+        return res.sendStatus(200);
+      }
+
+      // get or create user
       let user;
       const getUserRes = await supabase(
         `users?telegram_id=eq.${telegramId}`,
@@ -62,24 +78,21 @@ app.post("/webhook", async (req, res) => {
       const users = await getUserRes.json();
       user = users[0];
 
-      // 2. CREATE user if not exists
       if (!user) {
         const createUserRes = await supabase("users", "POST", {
           telegram_id: telegramId,
           role: "user"
         });
-        const createdUsers = await createUserRes.json();
-        user = createdUsers[0];
+        const created = await createUserRes.json();
+        user = created[0];
       }
 
-      // 3. GET balance
-      const balanceCheckRes = await supabase(
+      // ensure balance
+      const balanceRes = await supabase(
         `user_balances?user_id=eq.${user.id}`,
         "GET"
       );
-      const balances = await balanceCheckRes.json();
-
-      // 4. CREATE balance if not exists
+      const balances = await balanceRes.json();
       if (balances.length === 0) {
         await supabase("user_balances", "POST", {
           user_id: user.id,
@@ -87,11 +100,22 @@ app.post("/webhook", async (req, res) => {
         });
       }
 
+      // reply with Open App button
       await sendMessage(
         chatId,
-        "Welcome 👋\n\n" +
-          "You are registered on the platform.\n" +
-          "Use /balance to check your token balance."
+        "Welcome 👋\n\nOpen the app to view listings and your balance.",
+        {
+          inline_keyboard: [
+            [
+              {
+                text: "Open App",
+                web_app: {
+                  url: "https://YOUR_MINI_APP_URL"
+                }
+              }
+            ]
+          ]
+        }
       );
 
       return res.sendStatus(200);
@@ -99,7 +123,6 @@ app.post("/webhook", async (req, res) => {
 
     /* ---------- /balance ---------- */
     if (text.startsWith("/balance")) {
-      // 1. GET user
       const userRes = await supabase(
         `users?telegram_id=eq.${telegramId}`,
         "GET"
@@ -112,7 +135,6 @@ app.post("/webhook", async (req, res) => {
         return res.sendStatus(200);
       }
 
-      // 2. GET balance
       const balanceRes = await supabase(
         `user_balances?user_id=eq.${user.id}`,
         "GET"
