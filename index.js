@@ -33,12 +33,15 @@ app.post("/webhook", async (req, res) => {
   const telegramId = String(message.from.id);
   const text = message.text || "";
 
-  // ensure user exists
-  await supabaseRequest(
-    `users?telegram_id=eq.${telegramId}`,
-    "POST",
-    { telegram_id: telegramId }
-  );
+  // create user if not exists
+await supabaseRequest(
+  "users",
+  "POST",
+  {
+    telegram_id: telegramId,
+    role: "user"
+  }
+);
 
   if (text === "/start") {
     await fetch(`${TELEGRAM_API}/sendMessage`, {
