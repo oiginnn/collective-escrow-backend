@@ -110,7 +110,7 @@ app.post("/webhook", async (req, res) => {
               {
                 text: "Open App",
                 web_app: {
-                  url: "https://YOUR_MINI_APP_URL"
+                  url: "https://example.com"
                 }
               }
             ]
