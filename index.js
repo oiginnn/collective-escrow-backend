@@ -11,18 +11,16 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
 async function supabaseRequest(path, method = "GET", body) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+  return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     method,
     headers: {
-      "apikey": SUPABASE_KEY,
-      "Authorization": `Bearer ${SUPABASE_KEY}`,
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
       "Content-Type": "application/json",
-      "Prefer": "return=minimal"
+      Prefer: "return=minimal"
     },
     body: body ? JSON.stringify(body) : undefined
   });
-
-  return res;
 }
 
 app.post("/webhook", async (req, res) => {
@@ -31,30 +29,22 @@ app.post("/webhook", async (req, res) => {
 
   const chatId = message.chat.id;
   const telegramId = String(message.from.id);
-  const text = message.text || "";
+  const text = (message.text || "").trim();
 
-  // create user if not exists
-// create user
-const userRes = await supabaseRequest(
-  "users",
-  "POST",
-  {
-    telegram_id: telegramId,
-    role: "user"
-  }
-);
+  /* ---------- /start ---------- */
+  if (text.startsWith("/start")) {
+    // create user
+    await supabaseRequest("users", "POST", {
+      telegram_id: telegramId,
+      role: "user"
+    });
 
-// create balance (ignore if already exists)
-await supabaseRequest(
-  "user_balances",
-  "POST",
-  {
-    user_id: null,
-    balance: 0
-  }
-);
+    // create balance
+    await supabaseRequest("user_balances", "POST", {
+      user_id: null,
+      balance: 0
+    });
 
-  if (text === "/start") {
     await fetch(`${TELEGRAM_API}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -62,61 +52,41 @@ await supabaseRequest(
         chat_id: chatId,
         text:
           "Welcome 👋\n\n" +
-          "You are now registered on the platform.\n" +
-          "This service allows collective acquisition of unique items."
+          "You are now registered.\n" +
+          "Use /balance to check your token balance."
       })
     });
+
+    return res.sendStatus(200);
   }
-if (text === "/balance") {
-  // get user
-  const userRes = await fetch(
-    `${SUPABASE_URL}/rest/v1/users?telegram_id=eq.${telegramId}`,
-    {
-      headers: {
-        "apikey": SUPABASE_KEY,
-        "Authorization": `Bearer ${SUPABASE_KEY}`
+
+  /* ---------- /balance ---------- */
+  if (text.startsWith("/balance")) {
+    const balanceRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/user_balances?limit=1&order=created_at.desc`,
+      {
+        headers: {
+          apikey: SUPABASE_KEY,
+          Authorization: `Bearer ${SUPABASE_KEY}`
+        }
       }
-    }
-  );
+    );
 
-  const users = await userRes.json();
-  const user = users[0];
+    const balances = await balanceRes.json();
+    const balance = balances[0]?.balance ?? 0;
 
-  if (!user) {
     await fetch(`${TELEGRAM_API}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
-        text: "User not found. Please send /start first."
+        text: `Your balance: ${balance} tokens`
       })
     });
+
     return res.sendStatus(200);
   }
 
-  // get balance
-  const balanceRes = await fetch(
-    `${SUPABASE_URL}/rest/v1/user_balances?user_id=is.null&limit=1`,
-    {
-      headers: {
-        "apikey": SUPABASE_KEY,
-        "Authorization": `Bearer ${SUPABASE_KEY}`
-      }
-    }
-  );
-
-  const balances = await balanceRes.json();
-  const balance = balances[0]?.balance ?? 0;
-
-  await fetch(`${TELEGRAM_API}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: `Your balance: ${balance} tokens`
-    })
-  });
-}
   res.sendStatus(200);
 });
 
