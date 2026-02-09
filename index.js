@@ -67,7 +67,56 @@ await supabaseRequest(
       })
     });
   }
+if (text === "/balance") {
+  // get user
+  const userRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/users?telegram_id=eq.${telegramId}`,
+    {
+      headers: {
+        "apikey": SUPABASE_KEY,
+        "Authorization": `Bearer ${SUPABASE_KEY}`
+      }
+    }
+  );
 
+  const users = await userRes.json();
+  const user = users[0];
+
+  if (!user) {
+    await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: "User not found. Please send /start first."
+      })
+    });
+    return res.sendStatus(200);
+  }
+
+  // get balance
+  const balanceRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/user_balances?user_id=is.null&limit=1`,
+    {
+      headers: {
+        "apikey": SUPABASE_KEY,
+        "Authorization": `Bearer ${SUPABASE_KEY}`
+      }
+    }
+  );
+
+  const balances = await balanceRes.json();
+  const balance = balances[0]?.balance ?? 0;
+
+  await fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: `Your balance: ${balance} tokens`
+    })
+  });
+}
   res.sendStatus(200);
 });
 
