@@ -13,6 +13,8 @@ const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
+const MINI_APP_URL = "https://collective-escrow-miniapp.vercel.app";
+
 /* ================= HELPERS ================= */
 
 async function supabase(path, method = "GET", body) {
@@ -40,16 +42,18 @@ async function sendMessage(chatId, text, replyMarkup) {
   });
 }
 
-/* ============ TELEGRAM VERIFY ============ */
+/* ================= TELEGRAM VERIFY ================= */
+/* СТРОГО ПО ДОКУМЕНТАЦИИ TELEGRAM */
 
 function verifyTelegramInitData(initData) {
   const params = new URLSearchParams(initData);
+
   const hash = params.get("hash");
   params.delete("hash");
 
-  const dataCheckString = [...params.entries()]
-    .sort()
-    .map(([k, v]) => `${k}=${v}`)
+  const dataCheckString = Array.from(params.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}=${value}`)
     .join("\n");
 
   const secretKey = crypto
@@ -57,12 +61,12 @@ function verifyTelegramInitData(initData) {
     .update(BOT_TOKEN)
     .digest();
 
-  const hmac = crypto
+  const computedHash = crypto
     .createHmac("sha256", secretKey)
     .update(dataCheckString)
     .digest("hex");
 
-  return hmac === hash;
+  return computedHash === hash;
 }
 
 /* ================= BOT WEBHOOK ================= */
@@ -76,7 +80,7 @@ app.post("/webhook", async (req, res) => {
     const telegramId = String(message.from.id);
     const text = (message.text || "").trim();
 
-    if (text.startsWith("/start")) {
+    if (text === "/start") {
       // get or create user
       let user;
       const userRes = await supabase(
@@ -101,6 +105,7 @@ app.post("/webhook", async (req, res) => {
         "GET"
       );
       const balances = await balRes.json();
+
       if (balances.length === 0) {
         await supabase("user_balances", "POST", {
           user_id: user.id,
@@ -116,7 +121,7 @@ app.post("/webhook", async (req, res) => {
             {
               text: "Open App",
               web_app: {
-                url: "https://collective-escrow-miniapp.vercel.app"
+                url: MINI_APP_URL
               }
             }
           ]]
@@ -125,8 +130,8 @@ app.post("/webhook", async (req, res) => {
     }
 
     return res.sendStatus(200);
-  } catch (e) {
-    console.error("Webhook error:", e);
+  } catch (err) {
+    console.error("Webhook error:", err);
     return res.sendStatus(200);
   }
 });
@@ -137,7 +142,7 @@ app.post("/api/me", async (req, res) => {
   const { initData } = req.body;
 
   if (!initData || !verifyTelegramInitData(initData)) {
-    return res.status(403).json({ error: "Invalid Telegram signature" });
+    return res.status(403).json({ error: "Access denied" });
   }
 
   const params = new URLSearchParams(initData);
@@ -169,9 +174,13 @@ app.post("/api/me", async (req, res) => {
 
 /* ================= HEALTH ================= */
 
-app.get("/", (_, res) => res.send("Backend OK"));
+app.get("/", (_, res) => {
+  res.send("Backend OK");
+});
+
+/* ================= START ================= */
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
