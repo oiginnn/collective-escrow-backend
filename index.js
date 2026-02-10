@@ -5,12 +5,13 @@ import crypto from "crypto";
 const app = express();
 app.use(express.json());
 
+/* ========== CONFIG ========== */
+
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-const MINI_APP_URL = "https://collective-escrow-miniapp.vercel.app";
+/* ========== SUPABASE ========== */
 
 async function supabase(path, method = "GET", body) {
   return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
@@ -25,18 +26,22 @@ async function supabase(path, method = "GET", body) {
   });
 }
 
+/* ========== TELEGRAM VERIFY (CORRECT) ========== */
+
 function verifyTelegramInitData(initData) {
   const params = new URLSearchParams(initData);
+
   const hash = params.get("hash");
   params.delete("hash");
 
-  const dataCheckString = [...params.entries()]
+  const dataCheckString = Array.from(params.entries())
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${k}=${v}`)
+    .map(([key, value]) => `${key}=${value}`)
     .join("\n");
 
+  // 🔴 ВОТ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
   const secretKey = crypto
-    .createHash("sha256")
+    .createHmac("sha256", "WebAppData")
     .update(BOT_TOKEN)
     .digest();
 
@@ -47,6 +52,8 @@ function verifyTelegramInitData(initData) {
 
   return computedHash === hash;
 }
+
+/* ========== API ========== */
 
 app.post("/api/me", async (req, res) => {
   const { initData } = req.body;
@@ -66,13 +73,23 @@ app.post("/api/me", async (req, res) => {
   const users = await userRes.json();
   const user = users[0];
 
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
   const balRes = await supabase(
     `user_balances?user_id=eq.${user.id}`,
     "GET"
   );
   const balances = await balRes.json();
 
-  res.json({ balance: balances[0]?.balance ?? 0 });
+  return res.json({
+    balance: balances[0]?.balance ?? 0
+  });
 });
 
-app.listen(process.env.PORT || 3000);
+/* ========== START ========== */
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Backend running");
+});
