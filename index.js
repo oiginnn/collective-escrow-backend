@@ -29,15 +29,30 @@ async function supabase(path, method = "GET", body) {
 /* ========== TELEGRAM VERIFY (CORRECT) ========== */
 
 function verifyTelegramInitData(initData) {
-  const params = new URLSearchParams(initData);
+  const parsed = Object.fromEntries(
+    initData.split("&").map(p => p.split("="))
+  );
 
-  const hash = params.get("hash");
-  params.delete("hash");
+  const hash = parsed.hash;
+  delete parsed.hash;
 
-  const dataCheckString = Array.from(params.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([key, value]) => `${key}=${value}`)
+  const dataCheckString = Object.keys(parsed)
+    .sort()
+    .map(k => `${k}=${parsed[k]}`)
     .join("\n");
+
+  const secretKey = crypto
+    .createHmac("sha256", "WebAppData")
+    .update(BOT_TOKEN)
+    .digest();
+
+  const computedHash = crypto
+    .createHmac("sha256", secretKey)
+    .update(dataCheckString)
+    .digest("hex");
+
+  return computedHash === hash;
+}
 
   // 🔴 ВОТ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
   const secretKey = crypto
