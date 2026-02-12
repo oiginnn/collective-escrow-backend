@@ -1,110 +1,77 @@
 import express from "express";
 import fetch from "node-fetch";
-import crypto from "crypto";
 
 const app = express();
 app.use(express.json());
 
-/* ========== CONFIG ========== */
-
-const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-/* ========== SUPABASE ========== */
-
-async function supabase(path, method = "GET", body) {
-  return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    method,
+// --- helper: call Supabase REST ---
+async function sb(path) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     headers: {
       apikey: SUPABASE_KEY,
       Authorization: `Bearer ${SUPABASE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=representation"
-    },
-    body: body ? JSON.stringify(body) : undefined
+      "Content-Type": "application/json"
+    }
   });
+  return r;
 }
 
-/* ========== TELEGRAM VERIFY (CORRECT) ========== */
+/**
+ * GET /api/lots
+ * Returns active lots with computed progress (collected + percent)
+ * For MVP: public read.
+ */
+app.get("/api/lots", async (req, res) => {
+  try {
+    // 1) fetch active lots
+    const lotsRes = await sb(
+      "lots?status=eq.active&select=id,title,description,media,price_per_participation,goal_amount,ends_at,currency,created_at&order=created_at.desc&limit=50"
+    );
 
-function verifyTelegramInitData(initData) {
-  const parsed = Object.fromEntries(
-    initData.split("&").map(p => p.split("="))
-  );
+    if (!lotsRes.ok) {
+      const t = await lotsRes.text();
+      return res.status(500).json({ error: "supabase lots fetch failed", detail: t });
+    }
 
-  const hash = parsed.hash;
-  delete parsed.hash;
+    const lots = await lotsRes.json();
+    if (lots.length === 0) return res.json({ lots: [] });
 
-  const dataCheckString = Object.keys(parsed)
-    .sort()
-    .map(k => `${k}=${parsed[k]}`)
-    .join("\n");
+    // 2) compute collected per lot (reserved only) by extra requests (MVP-simple)
+    // NOTE: later optimize with SQL RPC or view
+    const enriched = [];
+    for (const lot of lots) {
+      const partsRes = await sb(
+        `lot_participants?lot_id=eq.${lot.id}&status=eq.reserved&select=amount`
+      );
 
-  const secretKey = crypto
-    .createHmac("sha256", "WebAppData")
-    .update(BOT_TOKEN)
-    .digest();
+      let collected = 0;
+      if (partsRes.ok) {
+        const parts = await partsRes.json();
+        for (const p of parts) collected += Number(p.amount || 0);
+      }
 
-  const computedHash = crypto
-    .createHmac("sha256", secretKey)
-    .update(dataCheckString)
-    .digest("hex");
+      const goal = Number(lot.goal_amount || 0);
+      const progress = goal > 0 ? Math.min(1, collected / goal) : 0;
 
-  return computedHash === hash;
-}
+      enriched.push({
+        ...lot,
+        collected,
+        progress // 0..1
+      });
+    }
 
-  // 🔴 ВОТ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
-  const secretKey = crypto
-    .createHmac("sha256", "WebAppData")
-    .update(BOT_TOKEN)
-    .digest();
-
-  const computedHash = crypto
-    .createHmac("sha256", secretKey)
-    .update(dataCheckString)
-    .digest("hex");
-
-  return computedHash === hash;
-}
-
-/* ========== API ========== */
-
-app.post("/api/me", async (req, res) => {
-  const { initData } = req.body;
-
-  if (!initData || !verifyTelegramInitData(initData)) {
-    return res.status(403).json({ error: "Access denied" });
+    return res.json({ lots: enriched });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "server error" });
   }
-
-  const params = new URLSearchParams(initData);
-  const tgUser = JSON.parse(params.get("user"));
-  const telegramId = String(tgUser.id);
-
-  const userRes = await supabase(
-    `users?telegram_id=eq.${telegramId}`,
-    "GET"
-  );
-  const users = await userRes.json();
-  const user = users[0];
-
-  if (!user) {
-    return res.status(404).json({ error: "User not found" });
-  }
-
-  const balRes = await supabase(
-    `user_balances?user_id=eq.${user.id}`,
-    "GET"
-  );
-  const balances = await balRes.json();
-
-  return res.json({
-    balance: balances[0]?.balance ?? 0
-  });
 });
 
-/* ========== START ========== */
+// health
+app.get("/", (_, res) => res.send("Backend OK"));
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Backend running");
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Listening on ${PORT}`));
