@@ -5,7 +5,7 @@ import crypto from "crypto";
 const app = express();
 app.use(express.json());
 
-// CORS
+// ----- CORS -----
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -16,12 +16,13 @@ app.use((req, res, next) => {
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const BOT_TOKEN = process.env.BOT_TOKEN;
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const ADMIN_TG_IDS = (process.env.ADMIN_TG_IDS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
+// ----- supabase helper -----
 async function sb(path, method = "GET", body) {
   const r = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     method,
@@ -29,32 +30,38 @@ async function sb(path, method = "GET", body) {
       apikey: SUPABASE_KEY,
       Authorization: `Bearer ${SUPABASE_KEY}`,
       "Content-Type": "application/json",
-      Prefer: "return=representation"
+      Prefer: "return=representation",
     },
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
   });
   return r;
 }
 
-// Telegram initData verify
+// ----- Telegram initData verify -----
 function verifyTelegramInitData(initData) {
-  const params = new URLSearchParams(initData);
-  const hash = params.get("hash");
-  if (!hash) return false;
-  params.delete("hash");
+  try {
+    if (!BOT_TOKEN) return false;
 
-  const dataCheckString = [...params.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${k}=${v}`)
-    .join("\n");
+    const params = new URLSearchParams(initData);
+    const hash = params.get("hash");
+    if (!hash) return false;
+    params.delete("hash");
 
-  const secretKey = crypto.createHash("sha256").update(BOT_TOKEN).digest();
-  const computedHash = crypto
-    .createHmac("sha256", secretKey)
-    .update(dataCheckString)
-    .digest("hex");
+    const dataCheckString = [...params.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\n");
 
-  return computedHash === hash;
+    const secretKey = crypto.createHash("sha256").update(BOT_TOKEN).digest();
+    const computedHash = crypto
+      .createHmac("sha256", secretKey)
+      .update(dataCheckString)
+      .digest("hex");
+
+    return computedHash === hash;
+  } catch {
+    return false;
+  }
 }
 
 function getTelegramIdFromInitData(initData) {
@@ -65,26 +72,56 @@ function getTelegramIdFromInitData(initData) {
   return String(tgUser.id);
 }
 
+function isAdminTelegramId(telegramId) {
+  return ADMIN_TG_IDS.includes(String(telegramId));
+}
+
 async function getUserByTelegramId(telegramId) {
   const r = await sb(`users?telegram_id=eq.${telegramId}&select=id,telegram_id,role`, "GET");
   const arr = await r.json();
   return arr[0] || null;
 }
 
+async function ensureUserExists(telegramId) {
+  // try get
+  let user = await getUserByTelegramId(telegramId);
+  if (user) return user;
+
+  // create user
+  const cr = await sb("users", "POST", { telegram_id: telegramId, role: "user" });
+  if (cr.ok) {
+    const created = await cr.json();
+    user = created[0];
+  } else {
+    // if already exists or race: re-fetch
+    user = await getUserByTelegramId(telegramId);
+  }
+
+  // ensure balance row
+  if (user?.id) {
+    await sb("user_balances", "POST", { user_id: user.id, balance: 0 });
+  }
+
+  return user;
+}
+
 async function getLotById(lotId) {
-  const r = await sb(`lots?id=eq.${lotId}&select=id,creator_id,status,currency,goal_amount,price_per_participation,ends_at,title`, "GET");
+  const r = await sb(
+    `lots?id=eq.${lotId}&select=id,creator_id,status,currency,title`,
+    "GET"
+  );
   const arr = await r.json();
   return arr[0] || null;
 }
 
-function isAdminTelegramId(telegramId) {
-  return ADMIN_TG_IDS.includes(String(telegramId));
-}
-
+// ---------- routes ----------
 app.get("/", (_, res) => res.send("Backend OK"));
 
+// version marker (to confirm deploy)
+app.get("/api/version", (_, res) => res.send("donate-v2"));
+
 /**
- * Public lots feed (NO donated totals shown)
+ * Public lots feed (NO donation totals)
  */
 app.get("/api/lots", async (req, res) => {
   try {
@@ -92,17 +129,22 @@ app.get("/api/lots", async (req, res) => {
       "lots?status=eq.active&select=id,title,description,media,price_per_participation,goal_amount,ends_at,currency,created_at&order=created_at.desc&limit=50",
       "GET"
     );
-    if (!lotsRes.ok) return res.status(500).json({ error: await lotsRes.text() });
+
+    if (!lotsRes.ok) {
+      const t = await lotsRes.text();
+      return res.status(500).json({ error: "supabase_lots_fetch_failed", detail: t });
+    }
 
     const lots = await lotsRes.json();
 
+    // compute progress from participants
     const enriched = [];
     for (const lot of lots) {
-      // collected from participants only
       const partsRes = await sb(
         `lot_participants?lot_id=eq.${lot.id}&status=eq.reserved&select=amount`,
         "GET"
       );
+
       let collected = 0;
       if (partsRes.ok) {
         const parts = await partsRes.json();
@@ -125,23 +167,20 @@ app.get("/api/lots", async (req, res) => {
 /**
  * Donate (private)
  * body: { initData, lotId, amount }
- * - fee 1%
- * - insert donations row
- * - insert ledger rows: donation (to seller) + platform_fee
  */
 app.post("/api/donate", async (req, res) => {
   try {
     const { initData, lotId, amount } = req.body;
 
     if (!initData || !verifyTelegramInitData(initData)) {
-      return res.status(403).json({ error: "Access denied" });
+      return res.status(403).json({ error: "access_denied_initdata" });
     }
 
     const telegramId = getTelegramIdFromInitData(initData);
-    if (!telegramId) return res.status(403).json({ error: "Access denied" });
+    if (!telegramId) return res.status(403).json({ error: "access_denied_user" });
 
-    const user = await getUserByTelegramId(telegramId);
-    if (!user) return res.status(404).json({ error: "user_not_found" });
+    const user = await ensureUserExists(telegramId);
+    if (!user) return res.status(500).json({ error: "user_create_failed" });
 
     const lot = await getLotById(lotId);
     if (!lot) return res.status(404).json({ error: "lot_not_found" });
@@ -152,43 +191,56 @@ app.post("/api/donate", async (req, res) => {
       return res.status(400).json({ error: "amount_min_1" });
     }
 
-    // fee 1%
-    const fee = Math.round(a * 0.01 * 100) / 100; // 2 decimals
+    // fee 1% with 2 decimals
+    const fee = Math.round(a * 0.01 * 100) / 100;
     const sellerAmount = Math.round((a - fee) * 100) / 100;
 
-    // 1) donation record
+    // donations row
     const insDonation = await sb("donations", "POST", {
       lot_id: lot.id,
       user_id: user.id,
       amount: a,
       platform_fee: fee,
       seller_amount: sellerAmount,
-      status: "confirmed"
+      status: "confirmed",
     });
-    if (!insDonation.ok) return res.status(500).json({ error: await insDonation.text() });
 
-    // 2) ledger: donation to seller
-    await sb("ledger", "POST", {
+    if (!insDonation.ok) {
+      const t = await insDonation.text();
+      return res.status(500).json({ error: "donation_insert_failed", detail: t });
+    }
+
+    // ledger rows
+    const insLedger1 = await sb("ledger", "POST", {
       actor_user_id: user.id,
       counterparty_user_id: lot.creator_id,
       lot_id: lot.id,
       type: "donation",
       amount: sellerAmount,
       status: "confirmed",
-      meta: { currency: lot.currency }
+      meta: { currency: lot.currency },
     });
 
-    // 3) ledger: platform fee
+    if (!insLedger1.ok) {
+      const t = await insLedger1.text();
+      return res.status(500).json({ error: "ledger_donation_failed", detail: t });
+    }
+
     if (fee > 0) {
-      await sb("ledger", "POST", {
+      const insLedger2 = await sb("ledger", "POST", {
         actor_user_id: user.id,
         counterparty_user_id: null,
         lot_id: lot.id,
         type: "platform_fee",
         amount: fee,
         status: "confirmed",
-        meta: { currency: lot.currency }
+        meta: { currency: lot.currency },
       });
+
+      if (!insLedger2.ok) {
+        const t = await insLedger2.text();
+        return res.status(500).json({ error: "ledger_fee_failed", detail: t });
+      }
     }
 
     return res.json({ ok: true });
@@ -205,23 +257,30 @@ app.post("/api/donate", async (req, res) => {
 app.post("/api/me/donations", async (req, res) => {
   try {
     const { initData } = req.body;
+
     if (!initData || !verifyTelegramInitData(initData)) {
-      return res.status(403).json({ error: "Access denied" });
+      return res.status(403).json({ error: "access_denied_initdata" });
     }
 
     const telegramId = getTelegramIdFromInitData(initData);
-    const user = await getUserByTelegramId(telegramId);
-    if (!user) return res.status(404).json({ error: "user_not_found" });
+    if (!telegramId) return res.status(403).json({ error: "access_denied_user" });
+
+    const user = await ensureUserExists(telegramId);
+    if (!user) return res.status(500).json({ error: "user_create_failed" });
 
     const r = await sb(
       `donations?user_id=eq.${user.id}&select=id,lot_id,amount,platform_fee,seller_amount,created_at,status&order=created_at.desc&limit=200`,
       "GET"
     );
-    if (!r.ok) return res.status(500).json({ error: await r.text() });
+
+    if (!r.ok) {
+      const t = await r.text();
+      return res.status(500).json({ error: "donations_fetch_failed", detail: t });
+    }
 
     const items = await r.json();
 
-    // add lot titles (small join-like)
+    // attach lot titles
     const lotIds = [...new Set(items.map(i => i.lot_id))].filter(Boolean);
     let lotMap = {};
     if (lotIds.length) {
@@ -236,7 +295,7 @@ app.post("/api/me/donations", async (req, res) => {
     const out = items.map(i => ({
       ...i,
       lot_title: lotMap[i.lot_id]?.title || "Lot",
-      currency: lotMap[i.lot_id]?.currency || "USDT"
+      currency: lotMap[i.lot_id]?.currency || "USDT",
     }));
 
     return res.json({ donations: out });
@@ -247,25 +306,27 @@ app.post("/api/me/donations", async (req, res) => {
 });
 
 /**
- * Seller history (private): donations for my lots
+ * Seller history (private)
  * body: { initData }
  */
 app.post("/api/seller/donations", async (req, res) => {
   try {
     const { initData } = req.body;
+
     if (!initData || !verifyTelegramInitData(initData)) {
-      return res.status(403).json({ error: "Access denied" });
+      return res.status(403).json({ error: "access_denied_initdata" });
     }
 
     const telegramId = getTelegramIdFromInitData(initData);
-    const user = await getUserByTelegramId(telegramId);
-    if (!user) return res.status(404).json({ error: "user_not_found" });
+    const user = await ensureUserExists(telegramId);
+    if (!user) return res.status(500).json({ error: "user_create_failed" });
 
-    // find lots where creator_id=user.id
+    // lots owned by seller
     const lotsRes = await sb(`lots?creator_id=eq.${user.id}&select=id,title,currency&limit=500`, "GET");
+    if (!lotsRes.ok) return res.status(500).json({ error: "seller_lots_fetch_failed", detail: await lotsRes.text() });
+
     const lots = await lotsRes.json();
     const lotIds = lots.map(l => l.id);
-
     if (!lotIds.length) return res.json({ donations: [] });
 
     const inList = `(${lotIds.map(id => `"${id}"`).join(",")})`;
@@ -273,7 +334,8 @@ app.post("/api/seller/donations", async (req, res) => {
       `donations?lot_id=in.${encodeURIComponent(inList)}&select=id,lot_id,user_id,amount,platform_fee,seller_amount,created_at,status&order=created_at.desc&limit=500`,
       "GET"
     );
-    if (!r.ok) return res.status(500).json({ error: await r.text() });
+
+    if (!r.ok) return res.status(500).json({ error: "seller_donations_fetch_failed", detail: await r.text() });
 
     const items = await r.json();
     const lotMap = Object.fromEntries(lots.map(l => [l.id, l]));
@@ -281,7 +343,7 @@ app.post("/api/seller/donations", async (req, res) => {
     const out = items.map(i => ({
       ...i,
       lot_title: lotMap[i.lot_id]?.title || "Lot",
-      currency: lotMap[i.lot_id]?.currency || "USDT"
+      currency: lotMap[i.lot_id]?.currency || "USDT",
     }));
 
     return res.json({ donations: out });
@@ -292,14 +354,15 @@ app.post("/api/seller/donations", async (req, res) => {
 });
 
 /**
- * Admin: all donations
+ * Admin: all donations (private)
  * body: { initData }
  */
 app.post("/api/admin/donations", async (req, res) => {
   try {
     const { initData } = req.body;
+
     if (!initData || !verifyTelegramInitData(initData)) {
-      return res.status(403).json({ error: "Access denied" });
+      return res.status(403).json({ error: "access_denied_initdata" });
     }
 
     const telegramId = getTelegramIdFromInitData(initData);
@@ -311,7 +374,11 @@ app.post("/api/admin/donations", async (req, res) => {
       `donations?select=id,lot_id,user_id,amount,platform_fee,seller_amount,created_at,status&order=created_at.desc&limit=500`,
       "GET"
     );
-    if (!r.ok) return res.status(500).json({ error: await r.text() });
+
+    if (!r.ok) {
+      const t = await r.text();
+      return res.status(500).json({ error: "admin_donations_fetch_failed", detail: t });
+    }
 
     const items = await r.json();
     return res.json({ donations: items });
