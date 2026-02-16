@@ -37,7 +37,7 @@ async function sb(path, method = "GET", body) {
   return r;
 }
 
-// ----- Telegram initData verify -----
+// ✅ Telegram Mini Apps initData verification (correct algo)
 function verifyTelegramInitData(initData) {
   try {
     if (!BOT_TOKEN) return false;
@@ -52,7 +52,13 @@ function verifyTelegramInitData(initData) {
       .map(([k, v]) => `${k}=${v}`)
       .join("\n");
 
-    const secretKey = crypto.createHash("sha256").update(BOT_TOKEN).digest();
+    // secretKey = HMAC_SHA256(key="WebAppData", message=BOT_TOKEN)
+    const secretKey = crypto
+      .createHmac("sha256", "WebAppData")
+      .update(BOT_TOKEN)
+      .digest();
+
+    // computedHash = HMAC_SHA256(key=secretKey, message=dataCheckString)
     const computedHash = crypto
       .createHmac("sha256", secretKey)
       .update(dataCheckString)
@@ -83,21 +89,17 @@ async function getUserByTelegramId(telegramId) {
 }
 
 async function ensureUserExists(telegramId) {
-  // try get
   let user = await getUserByTelegramId(telegramId);
   if (user) return user;
 
-  // create user
   const cr = await sb("users", "POST", { telegram_id: telegramId, role: "user" });
   if (cr.ok) {
     const created = await cr.json();
     user = created[0];
   } else {
-    // if already exists or race: re-fetch
     user = await getUserByTelegramId(telegramId);
   }
 
-  // ensure balance row
   if (user?.id) {
     await sb("user_balances", "POST", { user_id: user.id, balance: 0 });
   }
@@ -106,19 +108,14 @@ async function ensureUserExists(telegramId) {
 }
 
 async function getLotById(lotId) {
-  const r = await sb(
-    `lots?id=eq.${lotId}&select=id,creator_id,status,currency,title`,
-    "GET"
-  );
+  const r = await sb(`lots?id=eq.${lotId}&select=id,creator_id,status,currency,title,goal_amount,ends_at,media,description,price_per_participation,created_at`, "GET");
   const arr = await r.json();
   return arr[0] || null;
 }
 
 // ---------- routes ----------
 app.get("/", (_, res) => res.send("Backend OK"));
-
-// version marker (to confirm deploy)
-app.get("/api/version", (_, res) => res.send("donate-v2"));
+app.get("/api/version", (_, res) => res.send("donate-v3"));
 
 /**
  * Public lots feed (NO donation totals)
@@ -129,22 +126,16 @@ app.get("/api/lots", async (req, res) => {
       "lots?status=eq.active&select=id,title,description,media,price_per_participation,goal_amount,ends_at,currency,created_at&order=created_at.desc&limit=50",
       "GET"
     );
-
     if (!lotsRes.ok) {
-      const t = await lotsRes.text();
-      return res.status(500).json({ error: "supabase_lots_fetch_failed", detail: t });
+      return res.status(500).json({ error: "supabase_lots_fetch_failed", detail: await lotsRes.text() });
     }
 
     const lots = await lotsRes.json();
 
-    // compute progress from participants
+    // progress from participants only
     const enriched = [];
     for (const lot of lots) {
-      const partsRes = await sb(
-        `lot_participants?lot_id=eq.${lot.id}&status=eq.reserved&select=amount`,
-        "GET"
-      );
-
+      const partsRes = await sb(`lot_participants?lot_id=eq.${lot.id}&status=eq.reserved&select=amount`, "GET");
       let collected = 0;
       if (partsRes.ok) {
         const parts = await partsRes.json();
@@ -153,7 +144,6 @@ app.get("/api/lots", async (req, res) => {
 
       const goal = Number(lot.goal_amount || 0);
       const progress = goal > 0 ? Math.min(1, collected / goal) : 0;
-
       enriched.push({ ...lot, collected, progress });
     }
 
@@ -187,11 +177,9 @@ app.post("/api/donate", async (req, res) => {
     if (lot.status !== "active") return res.status(400).json({ error: "lot_not_active" });
 
     const a = Number(amount);
-    if (!Number.isFinite(a) || a < 1) {
-      return res.status(400).json({ error: "amount_min_1" });
-    }
+    if (!Number.isFinite(a) || a < 1) return res.status(400).json({ error: "amount_min_1" });
 
-    // fee 1% with 2 decimals
+    // fee 1%
     const fee = Math.round(a * 0.01 * 100) / 100;
     const sellerAmount = Math.round((a - fee) * 100) / 100;
 
@@ -204,13 +192,9 @@ app.post("/api/donate", async (req, res) => {
       seller_amount: sellerAmount,
       status: "confirmed",
     });
+    if (!insDonation.ok) return res.status(500).json({ error: "donation_insert_failed", detail: await insDonation.text() });
 
-    if (!insDonation.ok) {
-      const t = await insDonation.text();
-      return res.status(500).json({ error: "donation_insert_failed", detail: t });
-    }
-
-    // ledger rows
+    // ledger: donation
     const insLedger1 = await sb("ledger", "POST", {
       actor_user_id: user.id,
       counterparty_user_id: lot.creator_id,
@@ -220,12 +204,9 @@ app.post("/api/donate", async (req, res) => {
       status: "confirmed",
       meta: { currency: lot.currency },
     });
+    if (!insLedger1.ok) return res.status(500).json({ error: "ledger_donation_failed", detail: await insLedger1.text() });
 
-    if (!insLedger1.ok) {
-      const t = await insLedger1.text();
-      return res.status(500).json({ error: "ledger_donation_failed", detail: t });
-    }
-
+    // ledger: fee
     if (fee > 0) {
       const insLedger2 = await sb("ledger", "POST", {
         actor_user_id: user.id,
@@ -236,11 +217,7 @@ app.post("/api/donate", async (req, res) => {
         status: "confirmed",
         meta: { currency: lot.currency },
       });
-
-      if (!insLedger2.ok) {
-        const t = await insLedger2.text();
-        return res.status(500).json({ error: "ledger_fee_failed", detail: t });
-      }
+      if (!insLedger2.ok) return res.status(500).json({ error: "ledger_fee_failed", detail: await insLedger2.text() });
     }
 
     return res.json({ ok: true });
@@ -272,11 +249,7 @@ app.post("/api/me/donations", async (req, res) => {
       `donations?user_id=eq.${user.id}&select=id,lot_id,amount,platform_fee,seller_amount,created_at,status&order=created_at.desc&limit=200`,
       "GET"
     );
-
-    if (!r.ok) {
-      const t = await r.text();
-      return res.status(500).json({ error: "donations_fetch_failed", detail: t });
-    }
+    if (!r.ok) return res.status(500).json({ error: "donations_fetch_failed", detail: await r.text() });
 
     const items = await r.json();
 
@@ -299,89 +272,6 @@ app.post("/api/me/donations", async (req, res) => {
     }));
 
     return res.json({ donations: out });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "server_error" });
-  }
-});
-
-/**
- * Seller history (private)
- * body: { initData }
- */
-app.post("/api/seller/donations", async (req, res) => {
-  try {
-    const { initData } = req.body;
-
-    if (!initData || !verifyTelegramInitData(initData)) {
-      return res.status(403).json({ error: "access_denied_initdata" });
-    }
-
-    const telegramId = getTelegramIdFromInitData(initData);
-    const user = await ensureUserExists(telegramId);
-    if (!user) return res.status(500).json({ error: "user_create_failed" });
-
-    // lots owned by seller
-    const lotsRes = await sb(`lots?creator_id=eq.${user.id}&select=id,title,currency&limit=500`, "GET");
-    if (!lotsRes.ok) return res.status(500).json({ error: "seller_lots_fetch_failed", detail: await lotsRes.text() });
-
-    const lots = await lotsRes.json();
-    const lotIds = lots.map(l => l.id);
-    if (!lotIds.length) return res.json({ donations: [] });
-
-    const inList = `(${lotIds.map(id => `"${id}"`).join(",")})`;
-    const r = await sb(
-      `donations?lot_id=in.${encodeURIComponent(inList)}&select=id,lot_id,user_id,amount,platform_fee,seller_amount,created_at,status&order=created_at.desc&limit=500`,
-      "GET"
-    );
-
-    if (!r.ok) return res.status(500).json({ error: "seller_donations_fetch_failed", detail: await r.text() });
-
-    const items = await r.json();
-    const lotMap = Object.fromEntries(lots.map(l => [l.id, l]));
-
-    const out = items.map(i => ({
-      ...i,
-      lot_title: lotMap[i.lot_id]?.title || "Lot",
-      currency: lotMap[i.lot_id]?.currency || "USDT",
-    }));
-
-    return res.json({ donations: out });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "server_error" });
-  }
-});
-
-/**
- * Admin: all donations (private)
- * body: { initData }
- */
-app.post("/api/admin/donations", async (req, res) => {
-  try {
-    const { initData } = req.body;
-
-    if (!initData || !verifyTelegramInitData(initData)) {
-      return res.status(403).json({ error: "access_denied_initdata" });
-    }
-
-    const telegramId = getTelegramIdFromInitData(initData);
-    if (!isAdminTelegramId(telegramId)) {
-      return res.status(403).json({ error: "admin_only" });
-    }
-
-    const r = await sb(
-      `donations?select=id,lot_id,user_id,amount,platform_fee,seller_amount,created_at,status&order=created_at.desc&limit=500`,
-      "GET"
-    );
-
-    if (!r.ok) {
-      const t = await r.text();
-      return res.status(500).json({ error: "admin_donations_fetch_failed", detail: t });
-    }
-
-    const items = await r.json();
-    return res.json({ donations: items });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "server_error" });
