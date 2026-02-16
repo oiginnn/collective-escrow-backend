@@ -18,12 +18,14 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+
 const ADMIN_TG_IDS = (process.env.ADMIN_TG_IDS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
-const MINI_APP_URL = process.env.MINI_APP_URL || "https://collective-escrow-miniapp.vercel.app/";
+const MINI_APP_URL =
+  process.env.MINI_APP_URL || "https://collective-escrow-miniapp.vercel.app/";
 
 // ----- supabase helper -----
 async function sb(path, method = "GET", body) {
@@ -39,7 +41,7 @@ async function sb(path, method = "GET", body) {
   });
 }
 
-// ✅ Telegram Mini Apps initData verification (correct)
+// ✅ Telegram Mini Apps initData verification
 function verifyTelegramInitData(initData) {
   try {
     if (!BOT_TOKEN) return false;
@@ -83,7 +85,10 @@ function isAdminTelegramId(telegramId) {
 }
 
 async function getUserByTelegramId(telegramId) {
-  const r = await sb(`users?telegram_id=eq.${telegramId}&select=id,telegram_id,role`, "GET");
+  const r = await sb(
+    `users?telegram_id=eq.${telegramId}&select=id,telegram_id,role`,
+    "GET"
+  );
   const arr = await r.json();
   return arr[0] || null;
 }
@@ -108,7 +113,10 @@ async function ensureUserExists(telegramId) {
 }
 
 async function getBalance(userId) {
-  const r = await sb(`user_balances?user_id=eq.${userId}&select=user_id,balance`, "GET");
+  const r = await sb(
+    `user_balances?user_id=eq.${userId}&select=user_id,balance`,
+    "GET"
+  );
   const arr = await r.json();
   return Number(arr[0]?.balance || 0);
 }
@@ -156,7 +164,7 @@ async function authInitData(req, res) {
 
 // ---------- routes ----------
 app.get("/", (_, res) => res.send("Backend OK"));
-app.get("/api/version", (_, res) => res.send("donate-v7"));
+app.get("/api/version", (_, res) => res.send("donate-v8"));
 
 app.post("/webhook", async (req, res) => {
   try {
@@ -170,9 +178,15 @@ app.post("/webhook", async (req, res) => {
     if (telegramId) await ensureUserExists(telegramId);
 
     if (text.startsWith("/start") || text.startsWith("/app")) {
-      await tgSendMessage(chatId, "Welcome 👋\n\nOpen the app to view lots, donate, and participate.", {
-        reply_markup: { inline_keyboard: [[{ text: "Open app", web_app: { url: MINI_APP_URL } }]] },
-      });
+      await tgSendMessage(
+        chatId,
+        "Welcome 👋\n\nOpen the app to view lots, donate, and participate.",
+        {
+          reply_markup: {
+            inline_keyboard: [[{ text: "Open app", web_app: { url: MINI_APP_URL } }]],
+          },
+        }
+      );
       return res.sendStatus(200);
     }
 
@@ -197,7 +211,7 @@ app.get("/api/lots", async (req, res) => {
       "lots?status=eq.active&select=id,title,description,media,price_per_participation,goal_amount,ends_at,currency,created_at&order=created_at.desc&limit=50",
       "GET"
     );
-    if (!lotsRes.ok) return res.status(500).json({ error: "supabase_lots_fetch_failed", detail: await lotsRes.text() });
+    if (!lotsRes.ok) return res.status(500).json({ error: "supabase_lots_fetch_failed" });
 
     const lots = await lotsRes.json();
 
@@ -244,12 +258,13 @@ app.post("/api/me", async (req, res) => {
 });
 
 /**
- * Donate FROM BALANCE (private) — safe order + rollback
- * body: { initData, lotId, amount }
+ * Donate FROM BALANCE (private)
+ * IMPORTANT: ledger.type must be allowed by DB constraint
+ * Your DB allows: 'donation', 'platform_fee', ...
  */
 app.post("/api/donate", async (req, res) => {
-  let deducted = false;
   let prevBalance = null;
+  let didDeduct = false;
 
   try {
     const auth = await authInitData(req, res);
@@ -272,13 +287,13 @@ app.post("/api/donate", async (req, res) => {
     const fee = Math.round(a * 0.01 * 100) / 100;
     const sellerAmount = Math.round((a - fee) * 100) / 100;
 
-    // 1) deduct balance first BUT we will rollback if anything fails after
+    // deduct
     const newBalance = Math.round((balance - a) * 100) / 100;
     const okBal = await setBalance(auth.user.id, newBalance);
     if (!okBal) return res.status(500).json({ error: "balance_update_failed" });
-    deducted = true;
+    didDeduct = true;
 
-    // 2) insert donation row
+    // donation row
     const insDonation = await sb("donations", "POST", {
       lot_id: lot.id,
       user_id: auth.user.id,
@@ -287,20 +302,21 @@ app.post("/api/donate", async (req, res) => {
       seller_amount: sellerAmount,
       status: "confirmed",
     });
-    if (!insDonation.ok) throw new Error("donation_insert_failed: " + (await insDonation.text()));
+    if (!insDonation.ok) throw new Error("donation_insert_failed");
 
-    // 3) ledger rows
+    // ledger: DONATION (allowed by your constraint)
     const insLedger1 = await sb("ledger", "POST", {
       actor_user_id: auth.user.id,
       counterparty_user_id: lot.creator_id,
       lot_id: lot.id,
-      type: "donation_from_balance",
+      type: "donation",
       amount: sellerAmount,
       status: "confirmed",
       meta: { currency: lot.currency },
     });
-    if (!insLedger1.ok) throw new Error("ledger_donation_failed: " + (await insLedger1.text()));
+    if (!insLedger1.ok) throw new Error("ledger_write_failed");
 
+    // ledger: platform fee (allowed)
     if (fee > 0) {
       const insLedger2 = await sb("ledger", "POST", {
         actor_user_id: auth.user.id,
@@ -311,43 +327,56 @@ app.post("/api/donate", async (req, res) => {
         status: "confirmed",
         meta: { currency: lot.currency },
       });
-      if (!insLedger2.ok) throw new Error("ledger_fee_failed: " + (await insLedger2.text()));
+      if (!insLedger2.ok) throw new Error("ledger_write_failed");
     }
 
     return res.json({ ok: true, newBalance });
   } catch (e) {
     console.error(e);
 
-    // rollback balance if we already deducted
-    if (deducted && prevBalance !== null) {
+    // rollback balance if deducted
+    if (didDeduct && prevBalance !== null) {
       try {
-        await setBalance(req._authUserId || undefined, prevBalance); // may fail silently
+        const initData = req.body?.initData;
+        if (initData && verifyTelegramInitData(initData)) {
+          const tgId = getTelegramIdFromInitData(initData);
+          if (tgId) {
+            const u = await getUserByTelegramId(tgId);
+            if (u) await setBalance(u.id, prevBalance);
+          }
+        }
       } catch {}
     }
 
-    // If rollback needs correct userId, do explicit safe rollback:
-    try {
-      // Try to recover userId from initData to rollback properly
-      const initData = req.body?.initData;
-      if (initData && verifyTelegramInitData(initData)) {
-        const tgId = getTelegramIdFromInitData(initData);
-        if (tgId) {
-          const u = await getUserByTelegramId(tgId);
-          if (u && prevBalance !== null) await setBalance(u.id, prevBalance);
-        }
-      }
-    } catch {}
-
-    // Send clean error code back
-    const msg = String(e.message || "donate_failed");
-    if (msg.includes("donation_insert_failed")) return res.status(500).json({ error: "donation_insert_failed" });
-    if (msg.includes("ledger_")) return res.status(500).json({ error: "ledger_write_failed" });
+    if (String(e.message).includes("donation_insert_failed")) return res.status(500).json({ error: "donation_insert_failed" });
+    if (String(e.message).includes("ledger_write_failed")) return res.status(500).json({ error: "ledger_write_failed" });
     return res.status(500).json({ error: "donate_failed" });
   }
 });
 
 /**
- * Participate (private) — A2
+ * My donations history (private)
+ */
+app.post("/api/me/donations", async (req, res) => {
+  try {
+    const auth = await authInitData(req, res);
+    if (!auth) return;
+
+    const r = await sb(
+      `donations?user_id=eq.${auth.user.id}&select=id,lot_id,amount,platform_fee,seller_amount,status,created_at&order=created_at.desc&limit=200`,
+      "GET"
+    );
+    if (!r.ok) return res.status(500).json({ error: "donations_fetch_failed" });
+
+    return res.json({ donations: await r.json() });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+/**
+ * Participate (private)
  */
 app.post("/api/participate", async (req, res) => {
   try {
@@ -378,7 +407,7 @@ app.post("/api/participate", async (req, res) => {
       if (t.includes("uq_lot_participants_lot_user") || t.includes("duplicate key value")) {
         return res.status(400).json({ error: "already_participated" });
       }
-      return res.status(500).json({ error: "participant_insert_failed", detail: t });
+      return res.status(500).json({ error: "participant_insert_failed" });
     }
 
     const newBalance = Math.round((balance - price) * 100) / 100;
@@ -394,7 +423,7 @@ app.post("/api/participate", async (req, res) => {
       status: "confirmed",
       meta: { currency: lot.currency },
     });
-    if (!insLedger.ok) return res.status(500).json({ error: "ledger_participation_failed" });
+    if (!insLedger.ok) return res.status(500).json({ error: "ledger_write_failed" });
 
     return res.json({ ok: true, newBalance });
   } catch (e) {
@@ -416,6 +445,7 @@ app.post("/api/me/participations", async (req, res) => {
       "GET"
     );
     if (!r.ok) return res.status(500).json({ error: "participations_fetch_failed" });
+
     return res.json({ participations: await r.json() });
   } catch (e) {
     console.error(e);
@@ -424,29 +454,7 @@ app.post("/api/me/participations", async (req, res) => {
 });
 
 /**
- * My donations history (private)
- */
-app.post("/api/me/donations", async (req, res) => {
-  try {
-    const auth = await authInitData(req, res);
-    if (!auth) return;
-
-    const r = await sb(
-      `donations?user_id=eq.${auth.user.id}&select=id,lot_id,amount,platform_fee,seller_amount,status,created_at&order=created_at.desc&limit=200`,
-      "GET"
-    );
-    if (!r.ok) return res.status(500).json({ error: "donations_fetch_failed" });
-
-    const items = await r.json();
-    return res.json({ donations: items });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "server_error" });
-  }
-});
-
-/**
- * Admin test topup (private)
+ * Admin test topup (private) — use allowed type: admin_adjustment
  */
 app.post("/api/admin/topup", async (req, res) => {
   try {
@@ -472,7 +480,7 @@ app.post("/api/admin/topup", async (req, res) => {
       actor_user_id: auth.user.id,
       counterparty_user_id: target.id,
       lot_id: null,
-      type: "admin_topup_test",
+      type: "admin_adjustment",
       amount: a,
       status: "confirmed",
       meta: {},
