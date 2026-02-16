@@ -107,10 +107,10 @@ async function ensureUserExists(telegramId) {
   return user;
 }
 
-async function getBalanceRow(userId) {
+async function getBalance(userId) {
   const r = await sb(`user_balances?user_id=eq.${userId}&select=user_id,balance`, "GET");
   const arr = await r.json();
-  return arr[0] || null;
+  return Number(arr[0]?.balance || 0);
 }
 
 async function setBalance(userId, balance) {
@@ -156,9 +156,8 @@ async function authInitData(req, res) {
 
 // ---------- routes ----------
 app.get("/", (_, res) => res.send("Backend OK"));
-app.get("/api/version", (_, res) => res.send("donate-v6"));
+app.get("/api/version", (_, res) => res.send("donate-v7"));
 
-// --- Telegram webhook (бот) ---
 app.post("/webhook", async (req, res) => {
   try {
     const message = req.body.message;
@@ -190,8 +189,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 /**
- * Public lots feed (NO donation totals)
- * progress = participants only
+ * Public lots feed (progress = participants only)
  */
 app.get("/api/lots", async (req, res) => {
   try {
@@ -232,8 +230,7 @@ app.post("/api/me", async (req, res) => {
     const auth = await authInitData(req, res);
     if (!auth) return;
 
-    const bal = await getBalanceRow(auth.user.id);
-    const balance = Number(bal?.balance || 0);
+    const balance = await getBalance(auth.user.id);
 
     res.json({
       user: { id: auth.user.id, role: auth.user.role, telegram_id: auth.user.telegram_id },
@@ -247,10 +244,13 @@ app.post("/api/me", async (req, res) => {
 });
 
 /**
- * Donate FROM BALANCE (private)
+ * Donate FROM BALANCE (private) — safe order + rollback
  * body: { initData, lotId, amount }
  */
 app.post("/api/donate", async (req, res) => {
+  let deducted = false;
+  let prevBalance = null;
+
   try {
     const auth = await authInitData(req, res);
     if (!auth) return;
@@ -264,21 +264,21 @@ app.post("/api/donate", async (req, res) => {
     const a = Number(amount);
     if (!Number.isFinite(a) || a < 1) return res.status(400).json({ error: "amount_min_1" });
 
-    const balRow = await getBalanceRow(auth.user.id);
-    const balance = Number(balRow?.balance || 0);
-    if (balance < a) {
-      return res.status(400).json({ error: "insufficient_balance", need: a, balance });
-    }
+    const balance = await getBalance(auth.user.id);
+    prevBalance = balance;
+
+    if (balance < a) return res.status(400).json({ error: "insufficient_balance", need: a, balance });
 
     const fee = Math.round(a * 0.01 * 100) / 100;
     const sellerAmount = Math.round((a - fee) * 100) / 100;
 
-    // Deduct balance first (simple MVP; later we add transaction safety)
+    // 1) deduct balance first BUT we will rollback if anything fails after
     const newBalance = Math.round((balance - a) * 100) / 100;
     const okBal = await setBalance(auth.user.id, newBalance);
     if (!okBal) return res.status(500).json({ error: "balance_update_failed" });
+    deducted = true;
 
-    // donations row
+    // 2) insert donation row
     const insDonation = await sb("donations", "POST", {
       lot_id: lot.id,
       user_id: auth.user.id,
@@ -287,9 +287,9 @@ app.post("/api/donate", async (req, res) => {
       seller_amount: sellerAmount,
       status: "confirmed",
     });
-    if (!insDonation.ok) return res.status(500).json({ error: "donation_insert_failed", detail: await insDonation.text() });
+    if (!insDonation.ok) throw new Error("donation_insert_failed: " + (await insDonation.text()));
 
-    // ledger: donation to seller
+    // 3) ledger rows
     const insLedger1 = await sb("ledger", "POST", {
       actor_user_id: auth.user.id,
       counterparty_user_id: lot.creator_id,
@@ -299,9 +299,8 @@ app.post("/api/donate", async (req, res) => {
       status: "confirmed",
       meta: { currency: lot.currency },
     });
-    if (!insLedger1.ok) return res.status(500).json({ error: "ledger_donation_failed", detail: await insLedger1.text() });
+    if (!insLedger1.ok) throw new Error("ledger_donation_failed: " + (await insLedger1.text()));
 
-    // ledger: platform fee
     if (fee > 0) {
       const insLedger2 = await sb("ledger", "POST", {
         actor_user_id: auth.user.id,
@@ -312,13 +311,38 @@ app.post("/api/donate", async (req, res) => {
         status: "confirmed",
         meta: { currency: lot.currency },
       });
-      if (!insLedger2.ok) return res.status(500).json({ error: "ledger_fee_failed", detail: await insLedger2.text() });
+      if (!insLedger2.ok) throw new Error("ledger_fee_failed: " + (await insLedger2.text()));
     }
 
     return res.json({ ok: true, newBalance });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: "server_error" });
+
+    // rollback balance if we already deducted
+    if (deducted && prevBalance !== null) {
+      try {
+        await setBalance(req._authUserId || undefined, prevBalance); // may fail silently
+      } catch {}
+    }
+
+    // If rollback needs correct userId, do explicit safe rollback:
+    try {
+      // Try to recover userId from initData to rollback properly
+      const initData = req.body?.initData;
+      if (initData && verifyTelegramInitData(initData)) {
+        const tgId = getTelegramIdFromInitData(initData);
+        if (tgId) {
+          const u = await getUserByTelegramId(tgId);
+          if (u && prevBalance !== null) await setBalance(u.id, prevBalance);
+        }
+      }
+    } catch {}
+
+    // Send clean error code back
+    const msg = String(e.message || "donate_failed");
+    if (msg.includes("donation_insert_failed")) return res.status(500).json({ error: "donation_insert_failed" });
+    if (msg.includes("ledger_")) return res.status(500).json({ error: "ledger_write_failed" });
+    return res.status(500).json({ error: "donate_failed" });
   }
 });
 
@@ -339,9 +363,7 @@ app.post("/api/participate", async (req, res) => {
     const price = Number(lot.price_per_participation || 0);
     if (!(price > 0)) return res.status(400).json({ error: "lot_price_invalid" });
 
-    const balRow = await getBalanceRow(auth.user.id);
-    const balance = Number(balRow?.balance || 0);
-
+    const balance = await getBalance(auth.user.id);
     if (balance < price) return res.status(400).json({ error: "insufficient_balance", need: price, balance });
 
     const insPart = await sb("lot_participants", "POST", {
@@ -372,7 +394,7 @@ app.post("/api/participate", async (req, res) => {
       status: "confirmed",
       meta: { currency: lot.currency },
     });
-    if (!insLedger.ok) return res.status(500).json({ error: "ledger_participation_failed", detail: await insLedger.text() });
+    if (!insLedger.ok) return res.status(500).json({ error: "ledger_participation_failed" });
 
     return res.json({ ok: true, newBalance });
   } catch (e) {
@@ -393,9 +415,30 @@ app.post("/api/me/participations", async (req, res) => {
       `lot_participants?user_id=eq.${auth.user.id}&select=id,lot_id,amount,status,created_at&order=created_at.desc&limit=200`,
       "GET"
     );
-    if (!r.ok) return res.status(500).json({ error: "participations_fetch_failed", detail: await r.text() });
-
+    if (!r.ok) return res.status(500).json({ error: "participations_fetch_failed" });
     return res.json({ participations: await r.json() });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+/**
+ * My donations history (private)
+ */
+app.post("/api/me/donations", async (req, res) => {
+  try {
+    const auth = await authInitData(req, res);
+    if (!auth) return;
+
+    const r = await sb(
+      `donations?user_id=eq.${auth.user.id}&select=id,lot_id,amount,platform_fee,seller_amount,status,created_at&order=created_at.desc&limit=200`,
+      "GET"
+    );
+    if (!r.ok) return res.status(500).json({ error: "donations_fetch_failed" });
+
+    const items = await r.json();
+    return res.json({ donations: items });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "server_error" });
@@ -419,8 +462,7 @@ app.post("/api/admin/topup", async (req, res) => {
     const target = await getUserByTelegramId(String(userTelegramId));
     if (!target) return res.status(404).json({ error: "target_user_not_found" });
 
-    const balRow = await getBalanceRow(target.id);
-    const oldBal = Number(balRow?.balance || 0);
+    const oldBal = await getBalance(target.id);
     const newBal = Math.round((oldBal + a) * 100) / 100;
 
     const ok = await setBalance(target.id, newBal);
