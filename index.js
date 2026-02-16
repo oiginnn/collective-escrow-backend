@@ -17,10 +17,13 @@ app.use((req, res, next) => {
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
+const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const ADMIN_TG_IDS = (process.env.ADMIN_TG_IDS || "")
   .split(",")
   .map(s => s.trim())
   .filter(Boolean);
+
+const MINI_APP_URL = process.env.MINI_APP_URL || "https://collective-escrow-miniapp.vercel.app/";
 
 // ----- supabase helper -----
 async function sb(path, method = "GET", body) {
@@ -37,7 +40,7 @@ async function sb(path, method = "GET", body) {
   return r;
 }
 
-// ✅ Telegram Mini Apps initData verification (correct algo)
+// ✅ Telegram Mini Apps initData verification (correct)
 function verifyTelegramInitData(initData) {
   try {
     if (!BOT_TOKEN) return false;
@@ -52,13 +55,11 @@ function verifyTelegramInitData(initData) {
       .map(([k, v]) => `${k}=${v}`)
       .join("\n");
 
-    // secretKey = HMAC_SHA256(key="WebAppData", message=BOT_TOKEN)
     const secretKey = crypto
       .createHmac("sha256", "WebAppData")
       .update(BOT_TOKEN)
       .digest();
 
-    // computedHash = HMAC_SHA256(key=secretKey, message=dataCheckString)
     const computedHash = crypto
       .createHmac("sha256", secretKey)
       .update(dataCheckString)
@@ -108,14 +109,77 @@ async function ensureUserExists(telegramId) {
 }
 
 async function getLotById(lotId) {
-  const r = await sb(`lots?id=eq.${lotId}&select=id,creator_id,status,currency,title,goal_amount,ends_at,media,description,price_per_participation,created_at`, "GET");
+  const r = await sb(`lots?id=eq.${lotId}&select=id,creator_id,status,currency,title`, "GET");
   const arr = await r.json();
   return arr[0] || null;
 }
 
+async function tgSendMessage(chatId, text, extra = {}) {
+  return fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      ...extra,
+    }),
+  });
+}
+
 // ---------- routes ----------
 app.get("/", (_, res) => res.send("Backend OK"));
-app.get("/api/version", (_, res) => res.send("donate-v3"));
+app.get("/api/version", (_, res) => res.send("donate-v4"));
+
+// --- Telegram webhook (бот) ---
+app.post("/webhook", async (req, res) => {
+  try {
+    const message = req.body.message;
+    if (!message) return res.sendStatus(200);
+
+    const chatId = message.chat.id;
+    const telegramId = String(message.from?.id || "");
+    const text = (message.text || "").trim();
+
+    // ensure user exists for any interaction
+    if (telegramId) await ensureUserExists(telegramId);
+
+    // /start or /app → send button to open mini app
+    if (text.startsWith("/start") || text.startsWith("/app")) {
+      await tgSendMessage(
+        chatId,
+        "Welcome 👋\n\nOpen the app to view lots, donate, and participate.",
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: "Open app",
+                  web_app: { url: MINI_APP_URL },
+                },
+              ],
+            ],
+          },
+        }
+      );
+
+      return res.sendStatus(200);
+    }
+
+    // /help
+    if (text.startsWith("/help")) {
+      await tgSendMessage(
+        chatId,
+        "Commands:\n/start — show Open app button\n/app — open the app\n/help — this message"
+      );
+      return res.sendStatus(200);
+    }
+
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error(e);
+    return res.sendStatus(200);
+  }
+});
 
 /**
  * Public lots feed (NO donation totals)
@@ -132,7 +196,6 @@ app.get("/api/lots", async (req, res) => {
 
     const lots = await lotsRes.json();
 
-    // progress from participants only
     const enriched = [];
     for (const lot of lots) {
       const partsRes = await sb(`lot_participants?lot_id=eq.${lot.id}&status=eq.reserved&select=amount`, "GET");
@@ -179,11 +242,9 @@ app.post("/api/donate", async (req, res) => {
     const a = Number(amount);
     if (!Number.isFinite(a) || a < 1) return res.status(400).json({ error: "amount_min_1" });
 
-    // fee 1%
     const fee = Math.round(a * 0.01 * 100) / 100;
     const sellerAmount = Math.round((a - fee) * 100) / 100;
 
-    // donations row
     const insDonation = await sb("donations", "POST", {
       lot_id: lot.id,
       user_id: user.id,
@@ -194,7 +255,6 @@ app.post("/api/donate", async (req, res) => {
     });
     if (!insDonation.ok) return res.status(500).json({ error: "donation_insert_failed", detail: await insDonation.text() });
 
-    // ledger: donation
     const insLedger1 = await sb("ledger", "POST", {
       actor_user_id: user.id,
       counterparty_user_id: lot.creator_id,
@@ -206,7 +266,6 @@ app.post("/api/donate", async (req, res) => {
     });
     if (!insLedger1.ok) return res.status(500).json({ error: "ledger_donation_failed", detail: await insLedger1.text() });
 
-    // ledger: fee
     if (fee > 0) {
       const insLedger2 = await sb("ledger", "POST", {
         actor_user_id: user.id,
@@ -246,14 +305,13 @@ app.post("/api/me/donations", async (req, res) => {
     if (!user) return res.status(500).json({ error: "user_create_failed" });
 
     const r = await sb(
-      `donations?user_id=eq.${user.id}&select=id,lot_id,amount,platform_fee,seller_amount,created_at,status&order=created_at.desc&limit=200`,
+      `donations?user_id=eq.${user.id}&select=id,lot_id,amount,created_at,status&order=created_at.desc&limit=200`,
       "GET"
     );
     if (!r.ok) return res.status(500).json({ error: "donations_fetch_failed", detail: await r.text() });
 
     const items = await r.json();
 
-    // attach lot titles
     const lotIds = [...new Set(items.map(i => i.lot_id))].filter(Boolean);
     let lotMap = {};
     if (lotIds.length) {
