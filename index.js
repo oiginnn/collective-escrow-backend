@@ -113,6 +113,11 @@ async function getBalanceRow(userId) {
   return arr[0] || null;
 }
 
+async function setBalance(userId, balance) {
+  const upd = await sb(`user_balances?user_id=eq.${userId}`, "PATCH", { balance });
+  return upd.ok;
+}
+
 async function getLotById(lotId) {
   const r = await sb(
     `lots?id=eq.${lotId}&select=id,creator_id,status,currency,title,goal_amount,price_per_participation,ends_at,media,description,created_at`,
@@ -151,7 +156,7 @@ async function authInitData(req, res) {
 
 // ---------- routes ----------
 app.get("/", (_, res) => res.send("Backend OK"));
-app.get("/api/version", (_, res) => res.send("donate-v5"));
+app.get("/api/version", (_, res) => res.send("donate-v6"));
 
 // --- Telegram webhook (бот) ---
 app.post("/webhook", async (req, res) => {
@@ -166,15 +171,9 @@ app.post("/webhook", async (req, res) => {
     if (telegramId) await ensureUserExists(telegramId);
 
     if (text.startsWith("/start") || text.startsWith("/app")) {
-      await tgSendMessage(
-        chatId,
-        "Welcome 👋\n\nOpen the app to view lots, donate, and participate.",
-        {
-          reply_markup: {
-            inline_keyboard: [[{ text: "Open app", web_app: { url: MINI_APP_URL } }]],
-          },
-        }
-      );
+      await tgSendMessage(chatId, "Welcome 👋\n\nOpen the app to view lots, donate, and participate.", {
+        reply_markup: { inline_keyboard: [[{ text: "Open app", web_app: { url: MINI_APP_URL } }]] },
+      });
       return res.sendStatus(200);
     }
 
@@ -227,7 +226,6 @@ app.get("/api/lots", async (req, res) => {
 
 /**
  * /api/me (private)
- * returns: balance, role, isAdmin
  */
 app.post("/api/me", async (req, res) => {
   try {
@@ -249,7 +247,7 @@ app.post("/api/me", async (req, res) => {
 });
 
 /**
- * Donate (private)
+ * Donate FROM BALANCE (private)
  * body: { initData, lotId, amount }
  */
 app.post("/api/donate", async (req, res) => {
@@ -266,9 +264,21 @@ app.post("/api/donate", async (req, res) => {
     const a = Number(amount);
     if (!Number.isFinite(a) || a < 1) return res.status(400).json({ error: "amount_min_1" });
 
+    const balRow = await getBalanceRow(auth.user.id);
+    const balance = Number(balRow?.balance || 0);
+    if (balance < a) {
+      return res.status(400).json({ error: "insufficient_balance", need: a, balance });
+    }
+
     const fee = Math.round(a * 0.01 * 100) / 100;
     const sellerAmount = Math.round((a - fee) * 100) / 100;
 
+    // Deduct balance first (simple MVP; later we add transaction safety)
+    const newBalance = Math.round((balance - a) * 100) / 100;
+    const okBal = await setBalance(auth.user.id, newBalance);
+    if (!okBal) return res.status(500).json({ error: "balance_update_failed" });
+
+    // donations row
     const insDonation = await sb("donations", "POST", {
       lot_id: lot.id,
       user_id: auth.user.id,
@@ -279,17 +289,19 @@ app.post("/api/donate", async (req, res) => {
     });
     if (!insDonation.ok) return res.status(500).json({ error: "donation_insert_failed", detail: await insDonation.text() });
 
+    // ledger: donation to seller
     const insLedger1 = await sb("ledger", "POST", {
       actor_user_id: auth.user.id,
       counterparty_user_id: lot.creator_id,
       lot_id: lot.id,
-      type: "donation",
+      type: "donation_from_balance",
       amount: sellerAmount,
       status: "confirmed",
       meta: { currency: lot.currency },
     });
     if (!insLedger1.ok) return res.status(500).json({ error: "ledger_donation_failed", detail: await insLedger1.text() });
 
+    // ledger: platform fee
     if (fee > 0) {
       const insLedger2 = await sb("ledger", "POST", {
         actor_user_id: auth.user.id,
@@ -303,7 +315,7 @@ app.post("/api/donate", async (req, res) => {
       if (!insLedger2.ok) return res.status(500).json({ error: "ledger_fee_failed", detail: await insLedger2.text() });
     }
 
-    return res.json({ ok: true });
+    return res.json({ ok: true, newBalance });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "server_error" });
@@ -312,11 +324,6 @@ app.post("/api/donate", async (req, res) => {
 
 /**
  * Participate (private) — A2
- * body: { initData, lotId }
- * - checks user balance >= price_per_participation
- * - inserts lot_participants (reserved)
- * - decreases user_balances.balance
- * - writes ledger participation_lock
  */
 app.post("/api/participate", async (req, res) => {
   try {
@@ -335,11 +342,8 @@ app.post("/api/participate", async (req, res) => {
     const balRow = await getBalanceRow(auth.user.id);
     const balance = Number(balRow?.balance || 0);
 
-    if (balance < price) {
-      return res.status(400).json({ error: "insufficient_balance", need: price, balance });
-    }
+    if (balance < price) return res.status(400).json({ error: "insufficient_balance", need: price, balance });
 
-    // 1) insert participant (unique index prevents duplicates)
     const insPart = await sb("lot_participants", "POST", {
       lot_id: lot.id,
       user_id: auth.user.id,
@@ -349,19 +353,16 @@ app.post("/api/participate", async (req, res) => {
 
     if (!insPart.ok) {
       const t = await insPart.text();
-      // Unique violation -> already participated
-      if (t.includes("duplicate key value") || t.includes("uq_lot_participants_lot_user")) {
+      if (t.includes("uq_lot_participants_lot_user") || t.includes("duplicate key value")) {
         return res.status(400).json({ error: "already_participated" });
       }
       return res.status(500).json({ error: "participant_insert_failed", detail: t });
     }
 
-    // 2) update balance (decrease)
     const newBalance = Math.round((balance - price) * 100) / 100;
-    const updBal = await sb(`user_balances?user_id=eq.${auth.user.id}`, "PATCH", { balance: newBalance });
-    if (!updBal.ok) return res.status(500).json({ error: "balance_update_failed", detail: await updBal.text() });
+    const okBal = await setBalance(auth.user.id, newBalance);
+    if (!okBal) return res.status(500).json({ error: "balance_update_failed" });
 
-    // 3) ledger record
     const insLedger = await sb("ledger", "POST", {
       actor_user_id: auth.user.id,
       counterparty_user_id: null,
@@ -374,28 +375,6 @@ app.post("/api/participate", async (req, res) => {
     if (!insLedger.ok) return res.status(500).json({ error: "ledger_participation_failed", detail: await insLedger.text() });
 
     return res.json({ ok: true, newBalance });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "server_error" });
-  }
-});
-
-/**
- * My donations (private)
- */
-app.post("/api/me/donations", async (req, res) => {
-  try {
-    const auth = await authInitData(req, res);
-    if (!auth) return;
-
-    const r = await sb(
-      `donations?user_id=eq.${auth.user.id}&select=id,lot_id,amount,created_at,status&order=created_at.desc&limit=200`,
-      "GET"
-    );
-    if (!r.ok) return res.status(500).json({ error: "donations_fetch_failed", detail: await r.text() });
-
-    const items = await r.json();
-    return res.json({ donations: items });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "server_error" });
@@ -416,8 +395,7 @@ app.post("/api/me/participations", async (req, res) => {
     );
     if (!r.ok) return res.status(500).json({ error: "participations_fetch_failed", detail: await r.text() });
 
-    const items = await r.json();
-    return res.json({ participations: items });
+    return res.json({ participations: await r.json() });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "server_error" });
@@ -426,17 +404,13 @@ app.post("/api/me/participations", async (req, res) => {
 
 /**
  * Admin test topup (private)
- * body: { initData, userTelegramId, amount }
- * adds amount to user's balance
  */
 app.post("/api/admin/topup", async (req, res) => {
   try {
     const auth = await authInitData(req, res);
     if (!auth) return;
 
-    if (!isAdminTelegramId(auth.telegramId)) {
-      return res.status(403).json({ error: "admin_only" });
-    }
+    if (!isAdminTelegramId(auth.telegramId)) return res.status(403).json({ error: "admin_only" });
 
     const { userTelegramId, amount } = req.body;
     const a = Number(amount);
@@ -449,8 +423,8 @@ app.post("/api/admin/topup", async (req, res) => {
     const oldBal = Number(balRow?.balance || 0);
     const newBal = Math.round((oldBal + a) * 100) / 100;
 
-    const updBal = await sb(`user_balances?user_id=eq.${target.id}`, "PATCH", { balance: newBal });
-    if (!updBal.ok) return res.status(500).json({ error: "balance_update_failed", detail: await updBal.text() });
+    const ok = await setBalance(target.id, newBal);
+    if (!ok) return res.status(500).json({ error: "balance_update_failed" });
 
     await sb("ledger", "POST", {
       actor_user_id: auth.user.id,
